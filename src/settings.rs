@@ -200,7 +200,7 @@ impl MailSettings {
         list
     }
 
-    /// 按 Code 查找账号（对齐 C# `FindByCode`；大小写不敏感）。
+    /// 按 Code 查找账号（对应 C# `FindByCode`；本实现大小写不敏感，更宽容）。
     pub fn find_by_code(&self, code: &str) -> Option<&MailData> {
         self.data.iter().find(|e| e.code.eq_ignore_ascii_case(code))
     }
