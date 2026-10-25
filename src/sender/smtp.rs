@@ -62,10 +62,7 @@ impl SmtpEmailSender {
         match self.settings.read() {
             Ok(settings) => settings.clone(),
             Err(poisoned) => {
-                static WARNED: std::sync::Once = std::sync::Once::new();
-                WARNED.call_once(|| {
-                    dhrust::warn!("邮件配置读锁已毒化，已恢复读取（请检查此前的 panic）");
-                });
+                dhrust::warn_once!("邮件配置读锁已毒化，已恢复读取（请检查此前的 panic）");
                 poisoned.into_inner().clone()
             }
         }

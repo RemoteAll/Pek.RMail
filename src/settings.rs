@@ -249,13 +249,10 @@ impl MailSettings {
         match SecureSocketOption::parse(&self.secure_socket_option) {
             Some(option) => option,
             None => {
-                static WARNED: std::sync::Once = std::sync::Once::new();
-                WARNED.call_once(|| {
-                    dhrust::warn!(
-                        "邮件配置 SecureSocketOption 无法识别：{}（按 Auto 处理）",
-                        self.secure_socket_option
-                    );
-                });
+                dhrust::warn_once!(
+                    "邮件配置 SecureSocketOption 无法识别：{}（按 Auto 处理）",
+                    self.secure_socket_option
+                );
                 SecureSocketOption::Auto
             }
         }
