@@ -93,7 +93,7 @@ let sender = Arc::new(SmtpEmailSender::new(mailer.settings()));
 let manager = MailQueueManager::with_settings(provider, sender, &mailer.settings());
 manager.start()?;
 
-service.enqueue(EmailBox::new("user@example.com", "异步通知", "<p>稍后发送</p>"));
+service.enqueue(EmailBox::new("user@example.com", "异步通知", "<p>稍后发送</p>")).unwrap();
 // ...
 manager.stop();
 ```

@@ -244,15 +244,18 @@ impl MailSettings {
             })
     }
 
-    /// 解析安全套接字选项（非法值回退 Auto 并在日志中告警）。
+    /// 解析安全套接字选项（非法值回退 Auto；每个进程只告警一次，避免每次发送刷日志）。
     pub fn socket_option(&self) -> SecureSocketOption {
         match SecureSocketOption::parse(&self.secure_socket_option) {
             Some(option) => option,
             None => {
-                dhrust::warn!(
-                    "邮件配置 SecureSocketOption 无法识别：{}（按 Auto 处理）",
-                    self.secure_socket_option
-                );
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    dhrust::warn!(
+                        "邮件配置 SecureSocketOption 无法识别：{}（按 Auto 处理）",
+                        self.secure_socket_option
+                    );
+                });
                 SecureSocketOption::Auto
             }
         }

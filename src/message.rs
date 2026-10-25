@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{MailError, MailResult};
 
+/// 默认附件大小上限（25MB）。
+pub const DEFAULT_MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
+
 /// 附件来源（对应 C# `PhysicalFileAttachment` / `MemoryStreamAttachment`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttachmentSource {
@@ -51,15 +54,31 @@ impl Attachment {
         }
     }
 
-    /// 从读取器读入内存作为附件（适合动态生成内容）。
-    pub fn from_reader(
+    /// 从读取器读入内存作为附件（适合动态生成内容；默认上限 25MB）。
+    pub fn from_reader(name: impl Into<String>, reader: impl std::io::Read) -> MailResult<Self> {
+        Self::from_reader_limited(name, reader, DEFAULT_MAX_ATTACHMENT_BYTES)
+    }
+
+    /// 从读取器读入内存作为附件，超过 `max_bytes` 报错。
+    pub fn from_reader_limited(
         name: impl Into<String>,
-        mut reader: impl std::io::Read,
+        reader: impl std::io::Read,
+        max_bytes: u64,
     ) -> MailResult<Self> {
+        use std::io::Read;
+
         let mut bytes = Vec::new();
         reader
+            .take(max_bytes.saturating_add(1))
             .read_to_end(&mut bytes)
             .map_err(|e| MailError::Attachment(format!("读取附件数据失败：{e}")))?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(MailError::Attachment(format!(
+                "附件 {} 超过上限 {} 字节",
+                name.into(),
+                max_bytes
+            )));
+        }
         Ok(Self::from_bytes(name, bytes))
     }
 
@@ -84,13 +103,28 @@ impl Attachment {
         &self.source
     }
 
-    /// 读取附件内容。
+    /// 读取附件内容（默认上限 25MB）。
     pub fn read(&self) -> MailResult<Vec<u8>> {
+        self.read_limited(DEFAULT_MAX_ATTACHMENT_BYTES)
+    }
+
+    /// 读取附件内容，超过 `max_bytes` 报错。
+    pub fn read_limited(&self, max_bytes: u64) -> MailResult<Vec<u8>> {
         match &self.source {
-            AttachmentSource::File(path) => std::fs::read(path).map_err(|e| {
-                MailError::Attachment(format!("读取附件 {} 失败：{e}", path.display()))
-            }),
-            AttachmentSource::Memory(bytes) => Ok(bytes.clone()),
+            AttachmentSource::File(path) => {
+                dhrust::io::read_file_limited(path, max_bytes).map_err(|e| {
+                    MailError::Attachment(format!("读取附件 {} 失败：{e}", path.display()))
+                })
+            }
+            AttachmentSource::Memory(bytes) => {
+                if bytes.len() as u64 > max_bytes {
+                    return Err(MailError::Attachment(format!(
+                        "附件 {} 超过上限 {} 字节",
+                        self.name, max_bytes
+                    )));
+                }
+                Ok(bytes.clone())
+            }
         }
     }
 }
@@ -304,5 +338,20 @@ impl MailMessage {
     pub fn set_reply_to(mut self, address: impl Into<String>) -> Self {
         self.reply_to.push(address.into());
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attachment_size_limit_is_enforced() {
+        let attachment = Attachment::from_bytes("a.bin", vec![1u8, 2, 3, 4]);
+        assert_eq!(attachment.read_limited(4).unwrap(), vec![1, 2, 3, 4]);
+        assert!(attachment.read_limited(3).is_err());
+
+        let reader = std::io::Cursor::new(vec![1u8, 2, 3, 4]);
+        assert!(Attachment::from_reader_limited("b.bin", reader, 3).is_err());
     }
 }

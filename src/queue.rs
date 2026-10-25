@@ -5,11 +5,12 @@
 //!   **入队立即唤醒**，空闲时不产生周期唤醒开销（对齐“非必要不做周期性全量劳作”的要求）；
 //! - 队列为进程内内存队列（与 C# 一致），进程退出未发送的邮件不落盘。
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+use dhrust::threading::BlockingQueue;
 
 use crate::error::{MailError, MailResult};
 use crate::message::EmailBox;
@@ -19,91 +20,76 @@ use crate::settings::MailSettings;
 /// 默认空闲等待间隔（毫秒）。
 pub const DEFAULT_SLEEP_INTERVAL_MS: u64 = 3000;
 
+/// 默认停止等待上限（等当前发送结束）。
+pub const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// 邮件队列提供程序（线程安全，进程内）。
 #[derive(Debug, Default)]
 pub struct MailQueueProvider {
-    queue: Mutex<VecDeque<EmailBox>>,
-    ready: Condvar,
+    queue: BlockingQueue<EmailBox>,
 }
 
 impl MailQueueProvider {
-    /// 新建空队列。
+    /// 新建空队列（无容量上限）。
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// 新建带容量上限的队列（满时 `try_enqueue` 返回原邮件，供调用方背压）。
+    pub fn with_capacity(max_queue: usize) -> Self {
+        Self {
+            queue: BlockingQueue::with_capacity(max_queue),
+        }
+    }
+
     /// 队列邮件数量。
     pub fn count(&self) -> usize {
-        self.lock().len()
+        self.queue.len()
     }
 
     /// 队列是否为空。
     pub fn is_empty(&self) -> bool {
-        self.lock().is_empty()
+        self.queue.is_empty()
     }
 
-    /// 入队并唤醒等待线程。
-    pub fn enqueue(&self, mail_box: EmailBox) {
-        let mut queue = self.lock();
-        queue.push_back(mail_box);
-        drop(queue);
-        self.ready.notify_one();
+    /// 尝试入队（满/关闭时返回原邮件，不阻塞）。
+    pub fn try_enqueue(&self, mail_box: EmailBox) -> Result<(), Box<EmailBox>> {
+        self.queue.try_enqueue(mail_box).map_err(Box::new)
+    }
+
+    /// 入队并唤醒等待线程；队列已满返回 [`MailError::Queue`]。
+    pub fn enqueue(&self, mail_box: EmailBox) -> MailResult<()> {
+        self.try_enqueue(mail_box)
+            .map_err(|_| MailError::Queue("邮件队列已满，入队失败".to_string()))
     }
 
     /// 尝试出队（不阻塞）。
     pub fn try_dequeue(&self) -> Option<EmailBox> {
-        self.lock().pop_front()
+        self.queue.try_dequeue()
     }
 
     /// 等待出队：最多等待 `timeout`；超时返回 `None`。
-    ///
-    /// 入队会立即唤醒，不会空等到超时（用于队列线程）。
     pub fn dequeue_timeout(&self, timeout: Duration) -> Option<EmailBox> {
-        self.dequeue_timeout_while(timeout, || false)
+        self.queue.dequeue_timeout(timeout)
     }
 
     /// 等待出队，且 `should_stop()` 为 true 时立即返回 `None`。
-    ///
-    /// 队列线程用：停止标志与等待在**同一把锁**下判定，避免“停止通知早于开始等待”
-    /// 导致的丢失唤醒（否则要等满整个 `SleepInterval`）。
     pub fn dequeue_timeout_while(
         &self,
         timeout: Duration,
         should_stop: impl Fn() -> bool,
     ) -> Option<EmailBox> {
-        let deadline = Instant::now() + timeout;
-        let mut queue = self.lock();
-        loop {
-            if should_stop() {
-                return None;
-            }
-            if let Some(box_) = queue.pop_front() {
-                return Some(box_);
-            }
-            if timeout.is_zero() {
-                return None;
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return None;
-            }
-            let (guard, _) = self
-                .ready
-                .wait_timeout(queue, deadline - now)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            queue = guard;
-        }
+        self.queue.dequeue_timeout_while(timeout, should_stop)
     }
 
     /// 唤醒所有等待线程（停止队列时用）。
     pub fn notify_all(&self) {
-        self.ready.notify_all();
+        self.queue.notify_all();
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<EmailBox>> {
-        self.queue
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// 关闭队列（拒绝后续入队；已入队邮件仍可取出）。
+    pub fn close(&self) {
+        self.queue.close();
     }
 }
 
@@ -125,8 +111,8 @@ impl MailQueueService {
     }
 
     /// 入队。
-    pub fn enqueue(&self, box_: EmailBox) {
-        self.provider.enqueue(box_);
+    pub fn enqueue(&self, box_: EmailBox) -> MailResult<()> {
+        self.provider.enqueue(box_)
     }
 
     /// 队列邮件数量。
@@ -165,13 +151,13 @@ impl WorkerState {
 /// 用法：
 /// ```no_run
 /// # use std::sync::Arc;
-/// # use pek_rmail::{MailQueueManager, MailQueueProvider, MailQueueService, MailSettings, SmtpEmailSender};
+/// # use pek_rmail::{EmailBox, MailQueueManager, MailQueueProvider, MailQueueService, MailSettings, SmtpEmailSender};
 /// let provider = Arc::new(MailQueueProvider::new());
 /// let service = MailQueueService::new(provider.clone());
 /// let sender = Arc::new(SmtpEmailSender::new(MailSettings::default()));
 /// let manager = MailQueueManager::new(provider, sender, 3000);
 /// manager.start().unwrap();
-/// // service.enqueue(box);
+/// service.enqueue(EmailBox::new("user@example.com", "subject", "body")).unwrap();
 /// ```
 pub struct MailQueueManager {
     state: Arc<WorkerState>,
@@ -271,8 +257,14 @@ impl MailQueueManager {
         Ok(())
     }
 
-    /// 停止后台线程并等待退出。
+    /// 停止后台线程并等待退出（最多等 30 秒）。
     pub fn stop(&self) {
+        let _ = self.stop_timeout(DEFAULT_STOP_TIMEOUT);
+    }
+
+    /// 停止后台线程并最多等待 `timeout`；超时返回 `false`（线程被分离，稍后自行退出）。
+    pub fn stop_timeout(&self, timeout: Duration) -> bool {
+        let was_running = self.state.running.load(Ordering::Acquire);
         self.state.stop.store(true, Ordering::Release);
         self.state.provider.notify_all();
         let handle = self
@@ -280,19 +272,35 @@ impl MailQueueManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
-        if let Some(handle) = handle {
+
+        let stopped = if let Some(handle) = handle {
+            let deadline = Instant::now() + timeout;
+            while !handle.is_finished() {
+                if Instant::now() >= deadline {
+                    self.state.running.store(false, Ordering::Release);
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
             let _ = handle.join();
-        }
+            true
+        } else {
+            true
+        };
+
         self.state.running.store(false, Ordering::Release);
-        dhrust::info!("邮件发送队列已停止");
+        if was_running {
+            dhrust::info!("邮件发送队列已停止");
+        }
+        stopped
     }
 }
 
 impl Drop for MailQueueManager {
     fn drop(&mut self) {
-        // 防抖：未启动时 stop 也只做原子写
+        // 防抖：未启动时不做任何事；运行中最多等 2 秒，避免拖住进程退出
         if self.state.running.load(Ordering::Acquire) {
-            self.stop();
+            let _ = self.stop_timeout(Duration::from_secs(2));
         }
     }
 }
@@ -321,4 +329,30 @@ fn run_worker(state: &WorkerState) {
         }
     }
     state.running.store(false, Ordering::Release);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_capacity_rejects_overflow() {
+        let provider = MailQueueProvider::with_capacity(1);
+        assert!(
+            provider
+                .try_enqueue(EmailBox::new("a@example.com", "s1", "b"))
+                .is_ok()
+        );
+        assert!(
+            provider
+                .try_enqueue(EmailBox::new("b@example.com", "s2", "b"))
+                .is_err()
+        );
+        assert_eq!(provider.count(), 1);
+        assert!(
+            provider
+                .enqueue(EmailBox::new("c@example.com", "s3", "b"))
+                .is_err()
+        );
+    }
 }

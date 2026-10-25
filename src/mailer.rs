@@ -69,6 +69,9 @@ impl Mailer {
     }
 
     /// 外部修改配置后热加载；返回提示文本（空 = 未变化/纯内存模式）。
+    ///
+    /// 注意：本方法每次都会读取文件元数据（Windows 实测约 49µs），请按秒级/文件监听调用，
+    /// 不要放在每封邮件的发送路径上。
     pub fn reload_if_changed(&self) -> Vec<String> {
         let notes = self.store.reload_if_changed();
         for note in &notes {
@@ -132,12 +135,24 @@ impl Mailer {
 
     /// 按收件人后缀路由发送：`EmailSuffix` 命中优先，否则默认账号。
     ///
+    /// 仅当**所有收件人邮箱后缀一致**时才自动路由；多后缀混发请用
+    /// [`Self::send_box`] 或 [`Self::send_box_with_accounts`] 明确账号，避免误用单账号。
     /// 说明：C# 库只提供 `FindByCode` 手动路由；这里按 `EmailSuffix` 自动匹配，便于业务直接使用。
     pub fn send_box_routed(&self, box_: &EmailBox) -> MailResult<String> {
         let first_to = box_
             .to
             .first()
             .ok_or_else(|| MailError::Build("收件人为空".into()))?;
+        let suffix = dhrust::text::email_suffix(first_to);
+        if !box_
+            .to
+            .iter()
+            .all(|to| dhrust::text::email_suffix(to) == suffix)
+        {
+            return Err(MailError::Build(
+                "收件人邮箱后缀不一致，无法按后缀路由；请使用 send_box 或指定账号".into(),
+            ));
+        }
         self.sender.send_routed(&box_.to_message(), first_to)
     }
 
@@ -161,7 +176,7 @@ impl Mailer {
     /// 异步发送 [`EmailBox`]：在后台线程执行同步发送（库不引入异步运行时）。
     pub fn send_box_async(self: &Arc<Self>, box_: EmailBox) -> JoinHandle<MailResult<String>> {
         let this = Arc::clone(self);
-        std::thread::spawn(move || this.send_box(&box_))
+        dhrust::threading::spawn_named("pek-rmail-send", move || this.send_box(&box_))
     }
 }
 
@@ -187,5 +202,13 @@ mod tests {
         );
         assert_eq!(mailer.settings().sleep_interval, 43210);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn routed_send_rejects_mixed_suffixes() {
+        let mailer = Mailer::with_settings(MailSettings::default());
+        let mail_box = EmailBox::new("a@example.com", "s", "b").to("b@other.com");
+        let error = mailer.send_box_routed(&mail_box).unwrap_err();
+        assert!(matches!(error, MailError::Build(_)), "{error}");
     }
 }

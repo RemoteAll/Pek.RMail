@@ -297,8 +297,12 @@ fn queue_processes_enqueued_mail_and_wakes_immediately() {
     manager.start().unwrap();
     assert!(manager.is_running());
 
-    service.enqueue(EmailBox::new("a@example.com", "queued-1", "body"));
-    service.enqueue(EmailBox::new("b@example.com", "queued-2", "body"));
+    service
+        .enqueue(EmailBox::new("a@example.com", "queued-1", "body"))
+        .unwrap();
+    service
+        .enqueue(EmailBox::new("b@example.com", "queued-2", "body"))
+        .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(3);
     while sent.lock().unwrap().len() < 2 && Instant::now() < deadline {
