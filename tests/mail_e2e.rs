@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use pek_rmail::{
     Attachment, EmailBox, EmailSender, MailData, MailError, MailQueueManager, MailQueueProvider,
-    MailQueueService, MailSettings, MailSettingsFile, SmtpEmailSender,
+    MailQueueService, MailSettings, MailSettingsFile, Mailer, SmtpEmailSender,
 };
 
 /// 假 SMTP 服务器句柄：地址、收到的 DATA 内容、命令列表、线程句柄。
@@ -309,6 +309,43 @@ fn queue_processes_enqueued_mail_and_wakes_immediately() {
 
     let sent = sent.lock().unwrap().clone();
     assert_eq!(sent, vec!["queued-1", "queued-2"]);
+}
+
+#[test]
+fn mailer_open_save_and_send_via_config_file() {
+    let (addr, captured, _commands, server) = start_fake_smtp();
+    let dir = std::env::temp_dir().join(format!("pek-rmail-mailer-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mailer = Mailer::open_in(&dir);
+    assert!(
+        mailer.config_path().unwrap().ends_with("Config\\Mail.toml")
+            || mailer.config_path().unwrap().ends_with("Config/Mail.toml")
+    );
+    // 首次加载生成模板（带一条示例账号）
+    assert_eq!(mailer.settings().data.len(), 1);
+
+    let settings = MailSettings {
+        secure_socket_option: "None".to_string(),
+        data: vec![account("127.0.0.1", addr.port(), true)],
+        ..Default::default()
+    };
+    mailer.save_settings(settings).expect("保存配置");
+    let response = mailer
+        .send_box(&EmailBox::new("to@example.com", "via-config", "<p>hi</p>"))
+        .expect("通过 Mailer 发送");
+    assert!(response.contains("OK"), "{response}");
+
+    let _ = server.join();
+    let raw = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
+    assert!(
+        raw.contains("via-config") || raw.contains("Subject:"),
+        "{raw}"
+    );
+    let text = std::fs::read_to_string(mailer.config_path().unwrap()).unwrap();
+    assert!(text.contains(&format!("Port = {}", addr.port())), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
