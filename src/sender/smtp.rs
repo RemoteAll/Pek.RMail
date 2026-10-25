@@ -14,7 +14,7 @@ use lettre::transport::smtp::client::{Tls, TlsParameters};
 use lettre::{Address, SmtpTransport, Transport};
 
 use crate::error::{AccountFailure, MailError, MailResult};
-use crate::message::{MailMessage, MailPriority};
+use crate::message::{DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES, MailMessage, MailPriority};
 use crate::sender::EmailSender;
 use crate::settings::{MailData, MailSettings, SecureSocketOption};
 
@@ -86,12 +86,13 @@ impl SmtpEmailSender {
         fallback: bool,
     ) -> MailResult<String> {
         let settings = self.settings_snapshot();
-        let mut outgoing = message.clone();
-        if outgoing.from.trim().is_empty()
+        let mut from = message.from.clone();
+        let mut from_name = message.from_name.clone();
+        if from.trim().is_empty()
             && let Ok(default) = settings.find_default()
         {
-            outgoing.from = default.sender_address().to_string();
-            outgoing.from_name = default.from_name.clone();
+            from = default.sender_address().to_string();
+            from_name = default.from_name.clone();
         }
 
         let account = MailData {
@@ -101,32 +102,39 @@ impl SmtpEmailSender {
             is_ssl: enable_ssl,
             user_name: user_name.to_string(),
             password: password.to_string(),
-            from: outgoing.from.clone(),
-            from_name: outgoing.from_name.clone(),
+            from,
+            from_name,
             is_enabled: true,
             is_default: false,
             email_suffix: String::new(),
         };
 
-        match self.send_message(&outgoing, &account, &settings) {
+        match self.send_message(message, &account, &settings) {
             Ok(response) => Ok(response),
             Err(err) if fallback => {
                 dhrust::warn!("临时 SMTP 账号发送失败，改用配置账号轮换：{err}");
-                self.send(&outgoing)
+                self.send_with_settings(message, settings.find_all_enabled(), &settings)
             }
             Err(err) => Err(err),
         }
     }
 
-    /// 构建 MIME 消息。
-    fn build_message(message: &MailMessage) -> MailResult<Message> {
-        let from_address = message.from.trim();
+    /// 构建 MIME 消息；`from` / `from_name` / `reply_to` 由调用方覆盖，
+    /// 避免为了改三个字段而深拷贝整封邮件（附件可能是数十 MB）。
+    fn build_message(
+        message: &MailMessage,
+        from: &str,
+        from_name: &str,
+        reply_to: &[String],
+        max_total_attachment_bytes: u64,
+    ) -> MailResult<Message> {
+        let from_address = from.trim();
         if from_address.is_empty() {
             return Err(MailError::Build(
                 "发件人地址为空（请配置 From 或 UserName）".into(),
             ));
         }
-        let from = parse_mailbox(from_address, &message.from_name)?;
+        let from = parse_mailbox(from_address, from_name)?;
 
         let to = collect_mailboxes(&message.to, "收件人")?;
         if to.is_empty() {
@@ -134,7 +142,7 @@ impl SmtpEmailSender {
         }
         let cc = collect_mailboxes(&message.cc, "抄送")?;
         let bcc = collect_mailboxes(&message.bcc, "密送")?;
-        let reply_to = collect_mailboxes(&message.reply_to, "回复地址")?;
+        let reply_to = collect_mailboxes(reply_to, "回复地址")?;
 
         let mut builder = Message::builder()
             .from(from)
@@ -181,6 +189,18 @@ impl SmtpEmailSender {
             return builder
                 .singlepart(body_part)
                 .map_err(|e| MailError::Build(e.to_string()));
+        }
+
+        // 先按元数据/长度校验总量，避免多个附件叠加造成内存峰值；
+        // 单附件仍由 Attachment::read 的 25MB 上限保护。
+        let total_bytes = message.attachments.iter().try_fold(0u64, |total, item| {
+            item.size().map(|size| total.saturating_add(size))
+        })?;
+        if total_bytes > max_total_attachment_bytes {
+            return Err(MailError::Attachment(format!(
+                "附件总大小 {} 字节超过上限 {} 字节",
+                total_bytes, max_total_attachment_bytes
+            )));
         }
 
         let mut mixed = MultiPart::mixed().singlepart(body_part);
@@ -248,6 +268,8 @@ impl SmtpEmailSender {
         account: &MailData,
         settings: &MailSettings,
     ) -> MailResult<String> {
+        // 与 C# 一致：每次用账号的 From 覆盖，并把 Reply-To 设为发件人。
+        // 不克隆整封邮件：附件数据只在 build_message 里读取一次。
         let sender = account.sender_address().trim();
         if sender.is_empty() {
             return Err(MailError::Send {
@@ -255,14 +277,16 @@ impl SmtpEmailSender {
                 error: "发件人地址为空（From / UserName 均未配置）".into(),
             });
         }
+        let reply_to = [sender.to_string()];
 
-        // 与 C# 一致：每次用账号的 From 覆盖，并把 Reply-To 设为发件人
-        let mut outgoing = message.clone();
-        outgoing.from = sender.to_string();
-        outgoing.from_name = account.from_name.clone();
-        outgoing.reply_to = vec![sender.to_string()];
-
-        let email = Self::build_message(&outgoing).map_err(|e| MailError::Send {
+        let email = Self::build_message(
+            message,
+            sender,
+            &account.from_name,
+            &reply_to,
+            DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES,
+        )
+        .map_err(|e| MailError::Send {
             account: account.label().to_string(),
             error: e.to_string(),
         })?;
@@ -408,4 +432,26 @@ fn add_raw_header(
     let header_name = HeaderName::new_from_ascii(name.to_string())
         .map_err(|_| MailError::Build(format!("内置头名称不合法：{name}")))?;
     Ok(builder.raw_header(HeaderValue::new(header_name, value.to_string())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::Attachment;
+
+    #[test]
+    fn total_attachment_budget_is_enforced() {
+        let message = MailMessage::new("to@example.com", "s", "b", false)
+            .add_attachment(Attachment::from_bytes("a.txt", vec![0u8; 4]))
+            .add_attachment(Attachment::from_bytes("b.txt", vec![0u8; 4]));
+        let reply_to = ["from@example.com".to_string()];
+
+        let error = SmtpEmailSender::build_message(&message, "from@example.com", "", &reply_to, 7)
+            .unwrap_err();
+        assert!(matches!(error, MailError::Attachment(_)), "{error}");
+
+        assert!(
+            SmtpEmailSender::build_message(&message, "from@example.com", "", &reply_to, 8,).is_ok()
+        );
+    }
 }

@@ -7,6 +7,12 @@ use crate::error::{MailError, MailResult};
 /// 默认附件大小上限（25MB）。
 pub const DEFAULT_MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 
+/// 默认单封邮件附件总大小上限（50MB）。
+///
+/// 单附件上限之外再加总量上限，防止“多个 25MB 附件”叠加造成内存峰值；
+/// 常见 SMTP 服务商（Gmail/QQ/企业邮箱）的总量限制通常为 25~50MB。
+pub const DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES: u64 = 50 * 1024 * 1024;
+
 /// 附件来源（对应 C# `PhysicalFileAttachment` / `MemoryStreamAttachment`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttachmentSource {
@@ -106,6 +112,18 @@ impl Attachment {
     /// 读取附件内容（默认上限 25MB）。
     pub fn read(&self) -> MailResult<Vec<u8>> {
         self.read_limited(DEFAULT_MAX_ATTACHMENT_BYTES)
+    }
+
+    /// 附件大小（文件取元数据、内存取长度），供发送前总量校验。
+    pub fn size(&self) -> MailResult<u64> {
+        match &self.source {
+            AttachmentSource::File(path) => {
+                std::fs::metadata(path).map(|meta| meta.len()).map_err(|e| {
+                    MailError::Attachment(format!("读取附件 {} 信息失败：{e}", path.display()))
+                })
+            }
+            AttachmentSource::Memory(bytes) => Ok(bytes.len() as u64),
+        }
     }
 
     /// 读取附件内容，超过 `max_bytes` 报错。

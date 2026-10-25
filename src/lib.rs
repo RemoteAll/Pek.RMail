@@ -51,7 +51,10 @@ pub mod settings;
 
 pub use error::{AccountFailure, MailError, MailResult};
 pub use mailer::Mailer;
-pub use message::{Attachment, AttachmentSource, EmailBox, MailMessage, MailPriority};
+pub use message::{
+    Attachment, AttachmentSource, DEFAULT_MAX_ATTACHMENT_BYTES, DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES,
+    EmailBox, MailMessage, MailPriority,
+};
 pub use queue::{DEFAULT_SLEEP_INTERVAL_MS, MailQueueManager, MailQueueProvider, MailQueueService};
 pub use sender::{EmailSender, NullEmailSender, SmtpEmailSender};
 pub use settings::{

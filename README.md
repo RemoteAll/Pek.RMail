@@ -115,6 +115,9 @@ manager.stop();
 ## 7. 设计约束
 
 - **不新增异步运行时**：库内同步；消费方需要异步时用 `spawn_blocking` 或 `Mailer::send_box_async`；
+- **资源上限**：单附件默认 25MB（`Attachment::read_limited` 可自定义），单封邮件附件总量默认 50MB
+  （`DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES`）；队列可用 `MailQueueProvider::with_capacity` 设上限并背压；
+  `MailQueueManager::stop_timeout` 控制退出等待，`Drop` 最多等 2 秒；
 - **日志**：复用 `dhrust::logs`，只记发送成功/失败/账号切换，不逐轮询打印；
 - **基础工具下沉 `DH.RustBase`**：
   - `dhrust::text::is_email`（对齐 C# `ValidFormatHelper.IsEmail`）
@@ -131,4 +134,4 @@ cargo test
 cargo clippy --all-targets
 ```
 
-测试不依赖外网：`tests/mail_e2e.rs` 内置假 SMTP 服务器，覆盖 HTML/附件/多账号 fallback/队列/配置回写。
+测试不依赖外网：`tests/mail_e2e.rs` 内置假 SMTP 服务器，覆盖 HTML/附件/多账号 fallback/临时账号回退/队列/配置回写。

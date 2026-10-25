@@ -132,7 +132,8 @@ struct WorkerState {
     sender: Arc<dyn EmailSender>,
     interval_ms: AtomicU64,
     running: AtomicBool,
-    stop: AtomicBool,
+    /// 运行代次：每次 start/stop 递增，旧线程据此退出且不再改写 `running`。
+    epoch: AtomicU64,
 }
 
 impl WorkerState {
@@ -143,6 +144,10 @@ impl WorkerState {
         } else {
             ms
         })
+    }
+
+    fn is_current(&self, epoch: u64) -> bool {
+        self.epoch.load(Ordering::Acquire) == epoch
     }
 }
 
@@ -177,7 +182,7 @@ impl MailQueueManager {
                 sender,
                 interval_ms: AtomicU64::new(sleep_interval_ms),
                 running: AtomicBool::new(false),
-                stop: AtomicBool::new(false),
+                epoch: AtomicU64::new(0),
             }),
             worker: Mutex::new(None),
         }
@@ -237,14 +242,15 @@ impl MailQueueManager {
             return Ok(());
         }
 
-        self.state.stop.store(false, Ordering::Release);
+        // 先递增代次再置 running，确保旧线程退出时不会清掉新线程的运行标记。
+        let epoch = self.state.epoch.fetch_add(1, Ordering::AcqRel) + 1;
         self.state.running.store(true, Ordering::Release);
 
         let state = Arc::clone(&self.state);
         let thread_state = Arc::clone(&state);
         let handle = thread::Builder::new()
             .name("EmailQueue".to_string())
-            .spawn(move || run_worker(&thread_state))
+            .spawn(move || run_worker(&thread_state, epoch))
             .map_err(|e| {
                 state.running.store(false, Ordering::Release);
                 MailError::Queue(format!("启动邮件队列线程失败：{e}"))
@@ -265,7 +271,8 @@ impl MailQueueManager {
     /// 停止后台线程并最多等待 `timeout`；超时返回 `false`（线程被分离，稍后自行退出）。
     pub fn stop_timeout(&self, timeout: Duration) -> bool {
         let was_running = self.state.running.load(Ordering::Acquire);
-        self.state.stop.store(true, Ordering::Release);
+        // 递增代次 = 停止信号：旧线程退出后不会再把新线程的 running 置 false。
+        self.state.epoch.fetch_add(1, Ordering::AcqRel);
         self.state.provider.notify_all();
         let handle = self
             .worker
@@ -305,11 +312,11 @@ impl Drop for MailQueueManager {
     }
 }
 
-fn run_worker(state: &WorkerState) {
-    while !state.stop.load(Ordering::Acquire) {
+fn run_worker(state: &WorkerState, epoch: u64) {
+    while state.is_current(epoch) {
         let Some(box_) = state
             .provider
-            .dequeue_timeout_while(state.interval(), || state.stop.load(Ordering::Acquire))
+            .dequeue_timeout_while(state.interval(), || !state.is_current(epoch))
         else {
             continue;
         };
@@ -328,12 +335,37 @@ fn run_worker(state: &WorkerState) {
             ),
         }
     }
-    state.running.store(false, Ordering::Release);
+    if state.is_current(epoch) {
+        state.running.store(false, Ordering::Release);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::MailMessage;
+    use crate::settings::MailData;
+
+    struct BlockingSender {
+        started: std::sync::mpsc::Sender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl EmailSender for BlockingSender {
+        fn send(&self, _message: &MailMessage) -> MailResult<String> {
+            let _ = self.started.send(());
+            let _ = self.release.lock().unwrap().recv();
+            Ok("OK".to_string())
+        }
+
+        fn send_with_account(
+            &self,
+            _message: &MailMessage,
+            _account: &MailData,
+        ) -> MailResult<String> {
+            Ok("OK".to_string())
+        }
+    }
 
     #[test]
     fn provider_capacity_rejects_overflow() {
@@ -353,6 +385,44 @@ mod tests {
             provider
                 .enqueue(EmailBox::new("c@example.com", "s3", "b"))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn stale_worker_does_not_clear_running_after_restart() {
+        let provider = Arc::new(MailQueueProvider::new());
+        provider
+            .enqueue(EmailBox::new("a@example.com", "s1", "b"))
+            .unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let sender = Arc::new(BlockingSender {
+            started: started_tx,
+            release: Mutex::new(release_rx),
+        });
+        let state = Arc::new(WorkerState {
+            provider,
+            sender,
+            interval_ms: AtomicU64::new(30_000),
+            running: AtomicBool::new(true),
+            epoch: AtomicU64::new(1),
+        });
+
+        let thread_state = Arc::clone(&state);
+        let handle = thread::spawn(move || run_worker(&thread_state, 1));
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker should start sending");
+
+        // 模拟 stop_timeout 后立刻 start：新代次 + running 重新置 true。
+        state.epoch.store(2, Ordering::Release);
+        state.running.store(true, Ordering::Release);
+        release_tx.send(()).unwrap();
+        handle.join().unwrap();
+
+        assert!(
+            state.running.load(Ordering::Acquire),
+            "旧线程退出时不应清掉新线程的运行标记"
         );
     }
 }

@@ -10,8 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use pek_rmail::{
-    Attachment, EmailBox, EmailSender, MailData, MailError, MailQueueManager, MailQueueProvider,
-    MailQueueService, MailSettings, MailSettingsFile, Mailer, SmtpEmailSender,
+    Attachment, EmailBox, EmailSender, MailData, MailError, MailMessage, MailQueueManager,
+    MailQueueProvider, MailQueueService, MailSettings, MailSettingsFile, Mailer, SmtpEmailSender,
 };
 
 /// 假 SMTP 服务器句柄：地址、收到的 DATA 内容、命令列表、线程句柄。
@@ -228,6 +228,41 @@ fn smtp_falls_back_to_next_enabled_account() {
 
     let _ = server.join();
     assert!(!captured.lock().unwrap().is_empty());
+}
+
+#[test]
+fn temporary_send_falls_back_to_configured_accounts_with_attachment() {
+    // 临时账号指向无人监听的端口，验证 fallback=true 会改用配置账号，
+    // 且附件在回退路径上仍被正确构建。
+    let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = dead.local_addr().unwrap().port();
+    drop(dead);
+
+    let (addr, captured, _commands, server) = start_fake_smtp();
+    let sender = SmtpEmailSender::new(plain_settings(addr.port()));
+    let message =
+        MailMessage::new("to@example.com", "temporary-fallback", "body", false).add_attachment(
+            Attachment::from_bytes("temp.txt", b"temporary attachment".to_vec()),
+        );
+
+    let response = sender
+        .send_temporary(
+            &message,
+            "127.0.0.1",
+            dead_port,
+            "temp-user",
+            "temp-pass",
+            false,
+            true,
+        )
+        .expect("临时账号失败后应回退到配置账号");
+    assert!(response.contains("OK"), "{response}");
+
+    let _ = server.join();
+    let raw = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
+    assert!(raw.contains("temporary-fallback"), "{raw}");
+    assert!(raw.contains("temp.txt"), "{raw}");
+    assert!(raw.contains("temporary attachment"), "{raw}");
 }
 
 #[test]
