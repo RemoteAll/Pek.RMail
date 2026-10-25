@@ -56,7 +56,7 @@ impl SecureSocketOption {
 }
 
 /// 邮箱账号（对应 C# `Pek.Mail.MailData`）。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "PascalCase")]
 pub struct MailData {
     /// 惟一标识（未填写时日志用 Host 代替）
@@ -99,6 +99,24 @@ impl Default for MailData {
             is_default: false,
             email_suffix: String::new(),
         }
+    }
+}
+
+impl std::fmt::Debug for MailData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MailData")
+            .field("code", &self.code)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("is_ssl", &self.is_ssl)
+            .field("user_name", &self.user_name)
+            .field("password", &"***")
+            .field("from", &self.from)
+            .field("from_name", &self.from_name)
+            .field("is_enabled", &self.is_enabled)
+            .field("is_default", &self.is_default)
+            .field("email_suffix", &self.email_suffix)
+            .finish()
     }
 }
 
@@ -321,5 +339,22 @@ impl MailSettingsFile {
         self.config
             .save_with_arrays(&[("Data", &entries)])
             .map_err(|e| MailError::Config(format!("保存邮件配置失败：{e}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_password() {
+        let data = MailData {
+            code: "smtp".into(),
+            password: "super-secret".into(),
+            ..MailData::default()
+        };
+        let text = format!("{data:?}");
+        assert!(!text.contains("super-secret"), "{text}");
+        assert!(text.contains("***"), "{text}");
     }
 }
