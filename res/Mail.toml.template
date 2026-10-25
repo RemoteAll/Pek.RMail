@@ -1,0 +1,38 @@
+# Pek.RMail 邮件配置（TOML）
+#
+# 本文件由 Pek.RMail 生成与维护：首次生成即带全部字段说明；
+# 通过程序修改配置值时，注释与排版会被保留；也可直接编辑（支持注释），保存后自动热加载。
+#
+# 对应 C# `Pek.Mail` 的 `Config/Mail.config`（字段名保持一致，便于迁移与对照）。
+
+# 是否使用系统默认凭据（Windows 域账号）。Rust 版：为 true 时不做 SMTP AUTH，交由服务器/本机凭据处理
+UseDefaultCredentials = false
+# 域名。Windows 域认证时填写（仅 UseDefaultCredentials=true 时相关）
+Domain = ""
+# 队列空闲等待间隔（毫秒）。默认 3000；入队会立即唤醒，不会空等到间隔结束
+SleepInterval = 3000
+# 安全套接字选项：空=按账号 IsSSL 自动（true=SslOnConnect，false=StartTls 可用则升级）
+# 可选：Auto / None / SslOnConnect / StartTls
+SecureSocketOption = ""
+
+# 邮箱账号（可多条，按顺序 fallback；IsDefault=true 的优先）
+# Code：惟一标识（可自行命名）
+# Host/Port：SMTP 服务器与端口（常见：465=SSL，587=STARTTLS，25=明文）
+# IsSSL：是否直接 SSL 连接（端口 465 通常为 true）
+# UserName/Password：认证账号（163/QQ 企业邮箱常用授权码）
+# From/FromName：发件人地址与昵称（From 为空时回退到 UserName）
+# IsEnabled：是否启用（未启用的账号不参与发送，也不参与 fallback）
+# IsDefault：是否默认账号（默认账号优先，失败后按顺序轮换其余已启用账号）
+# EmailSuffix：收件人邮箱后缀路由（如 "example.com,corp.cn"；命中时优先使用该账号）
+[[Data]]
+Code = "account-001"
+Host = "smtp.example.com"
+Port = 465
+IsSSL = true
+UserName = "your_account@example.com"
+Password = "your_password"
+From = "your_account@example.com"
+FromName = "系统通知"
+IsEnabled = true
+IsDefault = true
+EmailSuffix = ""

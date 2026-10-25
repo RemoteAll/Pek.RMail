@@ -1,0 +1,31 @@
+[package]
+name = "pek-rmail"
+version = "0.1.0"
+edition = "2024"
+description = "Pek 邮件发送库（Rust）：SMTP 多账号轮换、EmailBox、附件、邮箱后缀路由、发送队列（对齐 C# Pek.Mail）"
+authors = ["PeiKeSmart"]
+license = "MIT"
+
+[dependencies]
+# DH 基础库：配置（TomlConfig 保注释读写/补齐/热加载）、日志、通用文本校验
+dhrust = { path = "../DH.RustBase", features = ["toml"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+# SMTP/MIME 编解码（rustls + ring：纯 Rust，可 zig 交叉编 musl；不引入 openssl）
+lettre = { version = "0.11", default-features = false, features = [
+    "builder",
+    "smtp-transport",
+    "rustls-tls",
+] }
+
+[profile.release]
+lto = "thin"
+strip = true
+incremental = true
+
+# 日常调测档（与生态各仓一致）：继承 release 的优化等级，但关闭 LTO、并行 codegen + 增量
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
