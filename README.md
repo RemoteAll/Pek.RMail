@@ -121,7 +121,7 @@ manager.stop();
   - `dhrust::text::email_suffix`（对齐 C# `MailHelper.GetEmailSuffix`）
   - `dhrust::text::split_mail_addresses`（按 `,`/`;` 拆分）
   - `dhrust::config::TomlConfig::save_with_arrays`（同步 `[[数组表]]` 并保留注释）
-- **SMTP/MIME**：使用 `lettre`（rustls + ring，纯 Rust，可 zig 交叉编 musl），不自研 MIME/认证。
+- **SMTP/MIME**：使用 `lettre`（rustls + ring，可 zig 交叉编 musl），不自研 MIME/认证。
 
 ## 8. 开发与回归
 
