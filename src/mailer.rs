@@ -134,13 +134,11 @@ impl Mailer {
     ///
     /// 说明：C# 库只提供 `FindByCode` 手动路由；这里按 `EmailSuffix` 自动匹配，便于业务直接使用。
     pub fn send_box_routed(&self, box_: &EmailBox) -> MailResult<String> {
-        let settings = self.settings();
         let first_to = box_
             .to
             .first()
             .ok_or_else(|| MailError::Build("收件人为空".into()))?;
-        let account = settings.route_for(first_to)?;
-        self.sender.send_with_account(&box_.to_message(), account)
+        self.sender.send_routed(&box_.to_message(), first_to)
     }
 
     /// 临时 SMTP 参数发送（对应 C# `Send(mail, Host, Port, ...)`）。

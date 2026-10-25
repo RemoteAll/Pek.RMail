@@ -59,7 +59,16 @@ impl SmtpEmailSender {
 
     /// 当前配置快照。
     pub fn settings_snapshot(&self) -> MailSettings {
-        self.settings.read().map(|s| s.clone()).unwrap_or_default()
+        match self.settings.read() {
+            Ok(settings) => settings.clone(),
+            Err(poisoned) => {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    dhrust::warn!("邮件配置读锁已毒化，已恢复读取（请检查此前的 panic）");
+                });
+                poisoned.into_inner().clone()
+            }
+        }
     }
 
     /// 使用临时 SMTP 参数发送（对应 C# `Send(mail, Host, Port, UserName, Password, EnableSsl, fallback)`）。
@@ -269,22 +278,22 @@ impl SmtpEmailSender {
         })?;
         Ok(response.message().collect::<Vec<_>>().join("\n"))
     }
-}
 
-impl EmailSender for SmtpEmailSender {
-    fn send(&self, message: &MailMessage) -> MailResult<String> {
-        let settings = self.settings_snapshot();
-        let accounts = settings.find_all_enabled();
-        if accounts.is_empty() {
-            return Err(MailError::Config(
-                "没有找到可用的邮箱配置，请检查 Mail.toml 中是否存在 IsEnabled=true 的邮箱账号"
-                    .to_string(),
-            ));
-        }
-
+    /// 用同一份配置快照依次尝试账号（`send` / `send_with_accounts` 共用）。
+    fn send_with_settings<'a, I>(
+        &self,
+        message: &MailMessage,
+        accounts: I,
+        settings: &MailSettings,
+    ) -> MailResult<String>
+    where
+        I: IntoIterator<Item = &'a MailData>,
+    {
         let mut failures = Vec::new();
+        let mut attempts = 0usize;
         for account in accounts {
-            match self.send_message(message, account, &settings) {
+            attempts += 1;
+            match self.send_message(message, account, settings) {
                 Ok(response) => {
                     dhrust::info!(
                         "邮件发送成功：账号={} 主题={} 收件人={}",
@@ -309,8 +318,40 @@ impl EmailSender for SmtpEmailSender {
             }
         }
 
-        let attempts = failures.len();
+        if attempts == 0 {
+            return Err(MailError::Config(
+                "没有找到可用的邮箱配置，请检查 Mail.toml 中是否存在 IsEnabled=true 的邮箱账号"
+                    .to_string(),
+            ));
+        }
         Err(MailError::AllFailed { attempts, failures })
+    }
+
+    /// 按收件人后缀路由，只快照一次配置（供 `Mailer::send_box_routed` 使用）。
+    pub(crate) fn send_routed(&self, message: &MailMessage, address: &str) -> MailResult<String> {
+        let settings = self.settings_snapshot();
+        let account = settings.route_for(address)?;
+        self.send_message(message, account, &settings)
+    }
+}
+
+impl EmailSender for SmtpEmailSender {
+    fn send(&self, message: &MailMessage) -> MailResult<String> {
+        let settings = self.settings_snapshot();
+        let accounts = settings.find_all_enabled();
+        self.send_with_settings(message, accounts, &settings)
+    }
+
+    fn send_with_accounts(
+        &self,
+        message: &MailMessage,
+        accounts: &[MailData],
+    ) -> MailResult<String> {
+        if accounts.is_empty() {
+            return self.send(message);
+        }
+        let settings = self.settings_snapshot();
+        self.send_with_settings(message, accounts.iter(), &settings)
     }
 
     fn send_with_account(&self, message: &MailMessage, account: &MailData) -> MailResult<String> {
