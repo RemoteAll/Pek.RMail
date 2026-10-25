@@ -206,9 +206,16 @@ impl MailQueueManager {
         Self::new(provider, sender, settings.sleep_interval_ms())
     }
 
-    /// 是否正在运行。
+    /// 是否正在运行（后台线程已异常退出时返回 false）。
     pub fn is_running(&self) -> bool {
-        self.state.running.load(Ordering::Acquire)
+        if !self.state.running.load(Ordering::Acquire) {
+            return false;
+        }
+        let worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        worker.as_ref().is_some_and(|handle| !handle.is_finished())
     }
 
     /// 队列邮件数量。
@@ -237,7 +244,9 @@ impl MailQueueManager {
             .worker
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.state.running.load(Ordering::Acquire) && worker.is_some() {
+        if self.state.running.load(Ordering::Acquire)
+            && worker.as_ref().is_some_and(|handle| !handle.is_finished())
+        {
             dhrust::warn!("邮件发送队列已在运行，忽略重复启动");
             return Ok(());
         }
